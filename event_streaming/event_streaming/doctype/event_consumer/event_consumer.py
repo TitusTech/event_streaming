@@ -11,7 +11,7 @@ from frappe import _
 from frappe.frappeclient import FrappeClient
 from frappe.model.document import Document
 from frappe.utils.background_jobs import get_jobs
-from frappe.utils.data import get_url
+from event_streaming.utils.utils import get_url
 
 
 class EventConsumer(Document):

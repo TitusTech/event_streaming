@@ -12,8 +12,9 @@ from frappe.custom.doctype.custom_field.custom_field import create_custom_field
 from frappe.frappeclient import FrappeClient
 from frappe.model.document import Document
 from frappe.utils.background_jobs import get_jobs
-from frappe.utils.data import get_link_to_form, get_url
+from frappe.utils.data import get_link_to_form
 from frappe.utils.password import get_decrypted_password
+from event_streaming.utils.utils import get_url
 
 
 class EventProducer(Document):
