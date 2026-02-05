@@ -236,12 +236,15 @@ def pull_from_node(event_producer):
 	producer_site = get_producer_site(event_producer.producer_url)
 	last_update = event_producer.get_last_update()
 
-	(doctypes, mapping_config, naming_config) = get_config(event_producer.producer_doctypes)
+	(doctypes, mapping_config, naming_config, name_conversion_config, name_conversion) = get_config(event_producer.producer_doctypes)
 
 	updates = get_updates(producer_site, last_update, doctypes)
 
 	for update in updates:
 		update.use_same_name = naming_config.get(update.ref_doctype)
+		update.has_name_conversion = name_conversion_config.get(update.ref_doctype)
+		if update.has_name_conversion:
+			update.name_conversion = name_conversion.get(update.ref_doctype)
 		mapping = mapping_config.get(update.ref_doctype)
 		if mapping:
 			update.mapping = mapping
@@ -254,7 +257,7 @@ def pull_from_node(event_producer):
 
 def get_config(event_config):
 	"""get the doctype mapping and naming configurations for consumption"""
-	doctypes, mapping_config, naming_config = [], {}, {}
+	doctypes, mapping_config, naming_config, name_conversion_config, name_conversion = [], {}, {}, {}, {}
 
 	for entry in event_config:
 		if entry.status == "Approved":
@@ -268,13 +271,18 @@ def get_config(event_config):
 			else:
 				naming_config[entry.ref_doctype] = entry.use_same_name
 				doctypes.append(entry.ref_doctype)
-	return (doctypes, mapping_config, naming_config)
+			name_conversion_config[entry.ref_doctype] = entry.name_conversion
+			if entry.has_name_conversion:
+				name_conversion[entry.ref_doctype] = entry.name_conversion
+	return (doctypes, mapping_config, naming_config, name_conversion_config, name_conversion)
 
 
 def sync(update, producer_site, event_producer, in_retry=False):
 	"""Sync the individual update"""
 	try:
 		if update.update_type == "Create":
+			if not update.use_same_name and update.has_name_conversion:
+				update.modified_name = update.name_conversion.replace("|name|", update.docname)
 			set_insert(update, producer_site, event_producer.name)
 		if update.update_type == "Update":
 			set_update(update, producer_site)
@@ -297,11 +305,13 @@ def sync(update, producer_site, event_producer, in_retry=False):
 
 def set_insert(update, producer_site, event_producer):
 	"""Sync insert type update"""
-	if frappe.db.get_value(update.ref_doctype, update.docname):
+	if update.use_same_name and frappe.db.get_value(update.ref_doctype, update.docname):
 		# doc already created
+		set_update(update, producer_site)
 		return
+	if not update.use_same_name and update.has_name_conversion:
+		update.data["name"] = update.modified_name
 	doc = frappe.get_doc(update.data)
-
 	if update.mapping:
 		if update.get("dependencies"):
 			dependencies_created = sync_mapped_dependencies(update.dependencies, producer_site)
@@ -317,7 +327,9 @@ def set_insert(update, producer_site, event_producer):
 		# store the remote docname in a custom field for future updates
 		doc.remote_docname = update.docname
 		doc.remote_site_name = event_producer
-		doc.insert(set_child_names=False)
+		if update.has_name_conversion:
+			doc.name = str(update.modified_name)
+		doc.insert(set_child_names=False, set_name=doc.name)
 
 
 def set_update(update, producer_site):
@@ -525,6 +537,8 @@ def log_event_sync(update, event_producer, sync_status, error=None):
 	doc.mapping = update.mapping if update.mapping else None
 	if update.use_same_name:
 		doc.docname = update.docname
+	elif not update.use_same_name and update.has_name_conversion and update.update_type == "Create":
+		doc.docname = update.modified_name
 	else:
 		doc.docname = frappe.db.get_value(update.ref_doctype, {"remote_docname": update.docname}, "name")
 	if error:
