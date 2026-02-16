@@ -22,25 +22,24 @@ class EventUpdateLog(Document):
 
 
 def notify_consumers(doc, event):
-	"""called via hooks"""
-	# make event update log for doctypes having event consumers
-	if frappe.flags.in_install or frappe.flags.in_migrate:
-		return
+    """called via hooks"""
+    if (frappe.flags.in_install or 
+        frappe.flags.in_migrate or 
+        frappe.flags.in_event_streaming):
+        return
 
-	consumers = check_doctype_has_consumers(doc.doctype)
-	if consumers:
-		if event == "after_insert":
-			doc.flags.event_update_log = make_event_update_log(doc, update_type="Create")
-		elif event == "on_trash":
-			make_event_update_log(doc, update_type="Delete")
-		else:
-			# on_update
-			# called after saving
-			if not doc.flags.event_update_log:  # if not already inserted
-				diff = get_update(doc.get_doc_before_save(), doc)
-				if diff:
-					doc.diff = diff
-					make_event_update_log(doc, update_type="Update")
+    consumers = check_doctype_has_consumers(doc.doctype)
+    if consumers:
+        if event == "after_insert":
+            doc.flags.event_update_log = make_event_update_log(doc, update_type="Create")
+        elif event == "on_trash":
+            make_event_update_log(doc, update_type="Delete")
+        else:
+            if not doc.flags.event_update_log:
+                diff = get_update(doc.get_doc_before_save(), doc)
+                if diff:
+                    doc.diff = diff
+                    make_event_update_log(doc, update_type="Update")
 
 ENABLED_DOCTYPES_CACHE_KEY = "event_streaming_enabled_doctypes"
 
