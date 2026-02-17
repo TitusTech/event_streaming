@@ -236,13 +236,14 @@ def pull_from_node(event_producer):
 	producer_site = get_producer_site(event_producer.producer_url)
 	last_update = event_producer.get_last_update()
 
-	(doctypes, mapping_config, naming_config, name_conversion_config, name_conversion) = get_config(event_producer.producer_doctypes)
+	(doctypes, mapping_config, naming_config, name_conversion_config, name_conversion, use_remote_doc) = get_config(event_producer.producer_doctypes)
 
 	updates = get_updates(producer_site, last_update, doctypes)
 
 	for update in updates:
 		update.use_same_name = naming_config.get(update.ref_doctype)
 		update.has_name_conversion = name_conversion_config.get(update.ref_doctype)
+		update.use_remote_doc = use_remote_doc.get(update.ref_doctype)
 		if update.has_name_conversion:
 			update.name_conversion = name_conversion.get(update.ref_doctype)
 		mapping = mapping_config.get(update.ref_doctype)
@@ -257,7 +258,7 @@ def pull_from_node(event_producer):
 
 def get_config(event_config):
 	"""get the doctype mapping and naming configurations for consumption"""
-	doctypes, mapping_config, naming_config, name_conversion_config, name_conversion = [], {}, {}, {}, {}
+	doctypes, mapping_config, naming_config, name_conversion_config, name_conversion, use_remote_doc = [], {}, {}, {}, {}, {}
 
 	for entry in event_config:
 		if entry.status == "Approved":
@@ -274,33 +275,40 @@ def get_config(event_config):
 			name_conversion_config[entry.ref_doctype] = entry.name_conversion
 			if entry.has_name_conversion:
 				name_conversion[entry.ref_doctype] = entry.name_conversion
-	return (doctypes, mapping_config, naming_config, name_conversion_config, name_conversion)
+			use_remote_doc[entry.ref_doctype] = entry.use_remote_doc
+	return (doctypes, mapping_config, naming_config, name_conversion_config, name_conversion, use_remote_doc)
 
 
 def sync(update, producer_site, event_producer, in_retry=False):
-	"""Sync the individual update"""
-	try:
-		if update.update_type == "Create":
-			if not update.use_same_name and update.has_name_conversion:
-				update.modified_name = update.name_conversion.replace("|name|", update.docname)
-			set_insert(update, producer_site, event_producer.name)
-		if update.update_type == "Update":
-			set_update(update, producer_site)
-		if update.update_type == "Delete":
-			set_delete(update)
-		if in_retry:
-			return "Synced"
-		log_event_sync(update, event_producer.name, "Synced")
+    """Sync the individual update"""
+    frappe.flags.in_event_streaming = True
+    try:
+        if update.update_type == "Create":
+            if not update.use_same_name and update.has_name_conversion:
+                update.modified_name = update.name_conversion.replace("|name|", update.docname)
+            set_insert(update, producer_site, event_producer.name)
 
-	except Exception:
-		if in_retry:
-			if frappe.flags.in_test:
-				print(frappe.get_traceback())
-			return "Failed"
-		log_event_sync(update, event_producer.name, "Failed", frappe.get_traceback())
+        elif update.update_type == "Update":
+            set_update(update, producer_site)
 
-	event_producer.set_last_update(update.creation)
-	frappe.db.commit()
+        elif update.update_type == "Delete":
+            set_delete(update)
+
+        if in_retry:
+            return "Synced"
+
+        log_event_sync(update, event_producer.name, "Synced")
+
+    except Exception:
+        if in_retry:
+            return "Failed"
+        log_event_sync(update, event_producer.name, "Failed", frappe.get_traceback())
+
+    finally:
+        frappe.flags.in_event_streaming = False
+
+    event_producer.set_last_update(update.creation)
+    frappe.db.commit()
 
 
 def set_insert(update, producer_site, event_producer):
@@ -334,7 +342,7 @@ def set_insert(update, producer_site, event_producer):
 
 def set_update(update, producer_site):
 	"""Sync update type update"""
-	local_doc = get_local_doc(update)
+	local_doc = get_local_doc(update, producer_site)
 	if local_doc:
 		data = frappe._dict(update.data)
 
@@ -419,9 +427,13 @@ def get_updates(producer_site, last_update, doctypes):
 	return [frappe._dict(d) for d in (docs or [])]
 
 
-def get_local_doc(update):
+def get_local_doc(update, producer_site=None):
 	"""Get the local document if created with a different name"""
 	try:
+		if update.use_remote_doc and producer_site:
+			foreign_doc = producer_site.get_doc(update.ref_doctype, update.docname)
+			target_docname = foreign_doc.get("remote_docname")
+			return frappe.get_doc(update.ref_doctype, target_docname)
 		if not update.use_same_name:
 			return frappe.get_doc(update.ref_doctype, {"remote_docname": update.docname})
 		return frappe.get_doc(update.ref_doctype, update.docname)
