@@ -3,9 +3,7 @@
 
 import json
 import time
-
 import requests
-
 import frappe
 from frappe import _
 from frappe.custom.doctype.custom_field.custom_field import create_custom_field
@@ -16,187 +14,212 @@ from frappe.utils.data import get_link_to_form
 from frappe.utils.password import get_decrypted_password
 from event_streaming.utils.utils import get_url
 
+EVENT_STREAMING_CACHE_KEY = "event_producer_document_types_map"
 
 class EventProducer(Document):
-	def before_insert(self):
-		self.check_url()
-		self.validate_event_subscriber()
-		self.incoming_change = True
-		self.create_event_consumer()
-		self.create_custom_fields()
 
-	def validate(self):
-		self.validate_event_subscriber()
-		if frappe.flags.in_test:
-			for entry in self.producer_doctypes:
-				entry.status = "Approved"
+    def after_insert(self):
+        self.rebuild_cache()
 
-	def validate_event_subscriber(self):
-		if not frappe.db.get_value("User", self.user, "api_key"):
-			frappe.throw(
-				_("Please generate keys for the Event Subscriber User {0} first.").format(
-					frappe.bold(get_link_to_form("User", self.user))
-				)
-			)
+    def rebuild_cache(self):
+        records = frappe.get_all(
+            "Event Producer Document Type",
+            fields=["*"],
+            ignore_ddl=True,
+        )
 
-	def on_update(self):
-		if not self.incoming_change:
-			if frappe.db.exists("Event Producer", self.name):
-				if not self.api_key or not self.api_secret:
-					frappe.throw(_("Please set API Key and Secret on the producer and consumer sites first."))
-				else:
-					doc_before_save = self.get_doc_before_save()
-					if doc_before_save.api_key != self.api_key or doc_before_save.api_secret != self.api_secret:
-						return
+        event_streaming_map = {
+            d["ref_doctype"]: d
+            for d in records
+        }
 
-					self.update_event_consumer()
-					self.create_custom_fields()
-		else:
-			# when producer doc is updated it updates the consumer doc, set flag to avoid deadlock
-			self.db_set("incoming_change", 0)
-			self.reload()
+        frappe.cache().set_value(
+            EVENT_STREAMING_CACHE_KEY,
+            event_streaming_map
+        )
 
-	def on_trash(self):
-		last_update = frappe.db.get_value("Event Producer Last Update", dict(event_producer=self.name))
-		if last_update:
-			frappe.delete_doc("Event Producer Last Update", last_update)
+    def before_insert(self):
+        self.check_url()
+        self.validate_event_subscriber()
+        self.incoming_change = True
+        self.create_event_consumer()
+        self.create_custom_fields()
 
-	def check_url(self):
-		valid_url_schemes = ("http", "https")
-		frappe.utils.validate_url(self.producer_url, throw=True, valid_schemes=valid_url_schemes)
+    def validate(self):
+        self.validate_event_subscriber()
 
-		# remove '/' from the end of the url like http://test_site.com/
-		# to prevent mismatch in get_url() results
-		if self.producer_url.endswith("/"):
-			self.producer_url = self.producer_url[:-1]
+        if frappe.flags.in_test:
+            for entry in self.producer_doctypes:
+                entry.status = "Approved"
 
-	def create_event_consumer(self):
-		"""register event consumer on the producer site"""
-		if self.is_producer_online():
-			producer_site = FrappeClient(
-				url=self.producer_url, api_key=self.api_key, api_secret=self.get_password("api_secret")
-			)
+    def validate_event_subscriber(self):
+        if not frappe.db.get_value("User", self.user, "api_key"):
+            frappe.throw(
+                _("Please generate keys for the Event Subscriber User {0} first.").format(
+                    frappe.bold(get_link_to_form("User", self.user))
+                )
+            )
 
-			response = producer_site.post_api(
-				"event_streaming.event_streaming.doctype.event_consumer.event_consumer.register_consumer",
-				params={"data": json.dumps(self.get_request_data())},
-			)
-			if response:
-				response = json.loads(response)
-				self.set_last_update(response["last_update"])
-			else:
-				frappe.throw(
-					_(
-						"Failed to create an Event Consumer or an Event Consumer for the current site is already registered."
-					)
-				)
+    def on_update(self):
+        if not self.incoming_change:
+            if frappe.db.exists("Event Producer", self.name):
+                if not self.api_key or not self.api_secret:
+                    frappe.throw(
+                        _("Please set API Key and Secret on the producer and consumer sites first.")
+                    )
+                else:
+                    doc_before_save = self.get_doc_before_save()
 
-	def set_last_update(self, last_update):
-		last_update_doc_name = frappe.db.get_value(
-			"Event Producer Last Update", dict(event_producer=self.name)
-		)
-		if not last_update_doc_name:
-			frappe.get_doc(
-				dict(
-					doctype="Event Producer Last Update",
-					event_producer=self.producer_url,
-					last_update=last_update,
-				)
-			).insert(ignore_permissions=True)
-		else:
-			frappe.db.set_value(
-				"Event Producer Last Update", last_update_doc_name, "last_update", last_update
-			)
+                    if doc_before_save.api_key != self.api_key or doc_before_save.api_secret != self.api_secret:
+                        return
 
-	def get_last_update(self):
-		return frappe.db.get_value(
-			"Event Producer Last Update", dict(event_producer=self.name), "last_update"
-		)
+                    self.update_event_consumer()
+                    self.create_custom_fields()
+        else:
+            # when producer doc is updated it updates the consumer doc, set flag to avoid deadlock
+            self.db_set("incoming_change", 0)
+            self.reload()
 
-	def get_request_data(self):
-		consumer_doctypes = []
-		for entry in self.producer_doctypes:
-			if entry.has_mapping:
-				# if mapping, subscribe to remote doctype on consumer's site
-				dt = frappe.db.get_value("Document Type Mapping", entry.mapping, "remote_doctype")
-			else:
-				dt = entry.ref_doctype
-			consumer_doctypes.append({"doctype": dt, "condition": entry.condition})
+        self.rebuild_cache()
 
-		user_key = frappe.db.get_value("User", self.user, "api_key")
-		user_secret = get_decrypted_password("User", self.user, "api_secret")
-		return {
-			"event_consumer": get_url(),
-			"consumer_doctypes": json.dumps(consumer_doctypes),
-			"user": self.user,
-			"api_key": user_key,
-			"api_secret": user_secret,
-		}
+    def on_trash(self):
+        last_update = frappe.db.get_value("Event Producer Last Update", dict(event_producer=self.name))
+        if last_update:
+            frappe.delete_doc("Event Producer Last Update", last_update)
+        self.rebuild_cache()
 
-	def create_custom_fields(self):
-		"""create custom field to store remote docname and remote site url"""
-		for entry in self.producer_doctypes:
-			if not entry.use_same_name:
-				if not frappe.db.exists(
-					"Custom Field", {"fieldname": "remote_docname", "dt": entry.ref_doctype}
-				):
-					df = dict(
-						fieldname="remote_docname",
-						label="Remote Document Name",
-						fieldtype="Data",
-						read_only=1,
-						print_hide=1,
-					)
-					create_custom_field(entry.ref_doctype, df)
-				if not frappe.db.exists(
-					"Custom Field", {"fieldname": "remote_site_name", "dt": entry.ref_doctype}
-				):
-					df = dict(
-						fieldname="remote_site_name",
-						label="Remote Site",
-						fieldtype="Data",
-						read_only=1,
-						print_hide=1,
-					)
-					create_custom_field(entry.ref_doctype, df)
+    def check_url(self):
+        valid_url_schemes = ("http", "https")
+        frappe.utils.validate_url(self.producer_url, throw=True, valid_schemes=valid_url_schemes)
 
-	def update_event_consumer(self):
-		if self.is_producer_online():
-			producer_site = get_producer_site(self.producer_url)
-			event_consumer = producer_site.get_doc("Event Consumer", get_url())
-			event_consumer = frappe._dict(event_consumer)
-			if event_consumer:
-				config = event_consumer.consumer_doctypes
-				event_consumer.consumer_doctypes = []
-				for entry in self.producer_doctypes:
-					if entry.has_mapping:
-						# if mapping, subscribe to remote doctype on consumer's site
-						ref_doctype = frappe.db.get_value("Document Type Mapping", entry.mapping, "remote_doctype")
-					else:
-						ref_doctype = entry.ref_doctype
+        if self.producer_url.endswith("/"):
+            self.producer_url = self.producer_url[:-1]
 
-					event_consumer.consumer_doctypes.append(
-						{
-							"ref_doctype": ref_doctype,
-							"status": get_approval_status(config, ref_doctype),
-							"unsubscribed": entry.unsubscribe,
-							"condition": entry.condition,
-						}
-					)
-				event_consumer.user = self.user
-				event_consumer.incoming_change = True
-				producer_site.update(event_consumer)
+    def create_event_consumer(self):
+        """register event consumer on the producer site"""
+        if self.is_producer_online():
+            producer_site = FrappeClient(
+                url=self.producer_url, 
+                api_key=self.api_key, 
+                api_secret=self.get_password("api_secret")
+            )
 
-	def is_producer_online(self):
-		"""check connection status for the Event Producer site"""
-		retry = 3
-		while retry > 0:
-			res = requests.get(self.producer_url)
-			if res.status_code == 200:
-				return True
-			retry -= 1
-			time.sleep(5)
-		frappe.throw(_("Failed to connect to the Event Producer site. Retry after some time."))
+            response = producer_site.post_api(
+                "event_streaming.event_streaming.doctype.event_consumer.event_consumer.register_consumer",
+                params={"data": json.dumps(self.get_request_data())},
+            )
+            if response:
+                response = json.loads(response)
+                self.set_last_update(response["last_update"])
+            else:
+                frappe.throw(
+                    _("Failed to create an Event Consumer or an Event Consumer for the current site is already registered.")
+                )
+
+    def set_last_update(self, last_update):
+        last_update_doc_name = frappe.db.get_value(
+            "Event Producer Last Update", dict(event_producer=self.name)
+        )
+        if not last_update_doc_name:
+            frappe.get_doc(
+                dict(
+                    doctype="Event Producer Last Update",
+                    event_producer=self.producer_url,
+                    last_update=last_update,
+                )
+            ).insert(ignore_permissions=True)
+        else:
+            frappe.db.set_value(
+                "Event Producer Last Update", last_update_doc_name, "last_update", last_update
+            )
+
+    def get_last_update(self):
+        return frappe.db.get_value(
+            "Event Producer Last Update", dict(event_producer=self.name), "last_update"
+        )
+
+    def get_request_data(self):
+        consumer_doctypes = []
+        for entry in self.producer_doctypes:
+            if entry.has_mapping:
+                dt = frappe.db.get_value("Document Type Mapping", entry.mapping, "remote_doctype")
+            else:
+                dt = entry.ref_doctype
+            consumer_doctypes.append({"doctype": dt, "condition": entry.condition})
+
+        user_key = frappe.db.get_value("User", self.user, "api_key")
+        user_secret = get_decrypted_password("User", self.user, "api_secret")
+        return {
+            "event_consumer": get_url(),
+            "consumer_doctypes": json.dumps(consumer_doctypes),
+            "user": self.user,
+            "api_key": user_key,
+            "api_secret": user_secret,
+        }
+
+    def create_custom_fields(self):
+        """create custom field to store remote docname and remote site url"""
+        for entry in self.producer_doctypes:
+            if not entry.use_same_name:
+                if not frappe.db.exists(
+                    "Custom Field", {"fieldname": "remote_docname", "dt": entry.ref_doctype}
+                ):
+                    df = dict(
+                        fieldname="remote_docname",
+                        label="Remote Document Name",
+                        fieldtype="Data",
+                        read_only=1,
+                        print_hide=1,
+                    )
+                    create_custom_field(entry.ref_doctype, df)
+                if not frappe.db.exists(
+                    "Custom Field", {"fieldname": "remote_site_name", "dt": entry.ref_doctype}
+                ):
+                    df = dict(
+                        fieldname="remote_site_name",
+                        label="Remote Site",
+                        fieldtype="Data",
+                        read_only=1,
+                        print_hide=1,
+                    )
+                    create_custom_field(entry.ref_doctype, df)
+
+    def update_event_consumer(self):
+        if self.is_producer_online():
+            producer_site = get_producer_site(self.producer_url)
+            event_consumer = producer_site.get_doc("Event Consumer", get_url())
+            event_consumer = frappe._dict(event_consumer)
+            if event_consumer:
+                config = event_consumer.consumer_doctypes
+                event_consumer.consumer_doctypes = []
+                for entry in self.producer_doctypes:
+                    if entry.has_mapping:
+                        ref_doctype = frappe.db.get_value("Document Type Mapping", entry.mapping, "remote_doctype")
+                    else:
+                        ref_doctype = entry.ref_doctype
+
+                    event_consumer.consumer_doctypes.append(
+                        {
+                            "ref_doctype": ref_doctype,
+                            "status": get_approval_status(config, ref_doctype),
+                            "unsubscribed": entry.unsubscribe,
+                            "condition": entry.condition,
+                        }
+                    )
+                event_consumer.user = self.user
+                event_consumer.incoming_change = True
+                producer_site.update(event_consumer)
+
+    def is_producer_online(self):
+        """check connection status for the Event Producer site"""
+        retry = 3
+        while retry > 0:
+            res = requests.get(self.producer_url)
+            if res.status_code == 200:
+                return True
+            retry -= 1
+            time.sleep(5)
+        frappe.throw(_("Failed to connect to the Event Producer site. Retry after some time."))
 
 
 def get_producer_site(producer_url):
@@ -310,41 +333,122 @@ def sync(update, producer_site, event_producer, in_retry=False):
     event_producer.set_last_update(update.creation)
     frappe.db.commit()
 
+def modify_insert_data_based_on_config(update_data, producer_site, event_producer):
+    event_streaming_map = get_event_streaming_map()
 
+    doctype = update_data.get("doctype") if isinstance(update_data, dict) else update_data.doctype
+    meta = frappe.get_meta(doctype)
+    link_fields = meta.get_link_fields()
+
+    for field in link_fields:
+        linked_doctype = field.options
+        config = event_streaming_map.get(linked_doctype)
+        
+
+        if config and config.get("use_remote_doc"):
+            foreign_doc = producer_site.get_doc(linked_doctype, update_data.get(field.fieldname))
+            target_docname = foreign_doc.get("remote_docname")
+            update_data[field.fieldname] = target_docname
+
+        elif config and config.get("has_name_conversion") and config.get("name_conversion"):
+            current_val = update_data.get(field.fieldname)
+            if current_val:
+                target_name = config.get("name_conversion").replace("|name|", current_val)
+                update_data[field.fieldname] = target_docname
+        else:
+            print(f"No sync config for {field.fieldname} ({linked_doctype})")
+
+    return update_data
+
+def modify_update_data_based_on_config(update_diff, producer_site, target_doctype):
+    event_streaming_map = get_event_streaming_map()
+
+    meta = frappe.get_meta(target_doctype)
+    link_fields = meta.get_link_fields()
+
+    for section in ["changed", "added"]:
+        section_data = update_diff.get(section) or {}
+
+        for field in link_fields:
+            fieldname = field.fieldname
+            linked_doctype = field.options
+
+            if fieldname not in section_data:
+                continue
+
+            config = event_streaming_map.get(linked_doctype)
+
+            current_val = section_data.get(fieldname)
+
+            if not current_val:
+                continue
+
+            if config and config.get("use_remote_doc"):
+                foreign_doc = producer_site.get_doc(linked_doctype, current_val)
+                target_docname = foreign_doc.get("remote_docname")
+                section_data[fieldname] = target_docname
+
+            elif config and config.get("has_name_conversion") and config.get("name_conversion"):
+                target_name = config.get("name_conversion").replace("|name|", current_val)
+                section_data[fieldname] = target_name
+
+            else:
+                print(f"No sync config for {fieldname} ({linked_doctype})")
+
+    return update_diff
 def set_insert(update, producer_site, event_producer):
-	"""Sync insert type update"""
-	if update.use_same_name and frappe.db.get_value(update.ref_doctype, update.docname):
-		# doc already created
-		set_update(update, producer_site)
-		return
-	if not update.use_same_name and update.has_name_conversion:
-		update.data["name"] = update.modified_name
-	doc = frappe.get_doc(update.data)
-	if update.mapping:
-		if update.get("dependencies"):
-			dependencies_created = sync_mapped_dependencies(update.dependencies, producer_site)
-			for fieldname, value in dependencies_created.items():
-				doc.update({fieldname: value})
-	else:
-		sync_dependencies(doc, producer_site)
+    """Sync insert type update"""
+    event_streaming_map = get_event_streaming_map()
 
-	if update.use_same_name:
-		doc.insert(set_name=update.docname, set_child_names=False)
-	else:
-		# if event consumer is not saving documents with the same name as the producer
-		# store the remote docname in a custom field for future updates
-		doc.remote_docname = update.docname
-		doc.remote_site_name = event_producer
-		if update.has_name_conversion:
-			doc.name = str(update.modified_name)
-		doc.insert(set_child_names=False, set_name=doc.name)
+    if update.use_same_name and frappe.db.get_value(update.ref_doctype, update.docname):
+        set_update(update, producer_site)
+        return
 
+    if not update.use_same_name and update.has_name_conversion:
+        update.data["name"] = update.modified_name
+
+    current_update_data = update.data
+    modified_update_data = modify_insert_data_based_on_config(current_update_data, producer_site, event_producer)
+
+    doc = frappe.get_doc(modified_update_data)
+    meta = frappe.get_meta(doc.doctype)
+    link_fields = meta.get_link_fields()
+
+    for field in link_fields:
+        linked_doctype = field.options
+        config = event_streaming_map.get(linked_doctype)
+
+        if config and config.get("use_remote_doc"):
+            foreign_doc = producer_site.get_doc(update.ref_doctype, update.docname)
+            target_docname = foreign_doc.get("remote_docname")
+            doc.set(field.fieldname, target_docname)
+
+    if update.mapping:
+        if update.get("dependencies"):
+            dependencies_created = sync_mapped_dependencies(update.dependencies, producer_site)
+            for fieldname, value in dependencies_created.items():
+                doc.update({fieldname: value})
+    else:
+        sync_dependencies(doc, producer_site)
+
+    if update.use_same_name:
+        doc.insert(set_name=update.docname, set_child_names=False)
+    else:
+        doc.remote_docname = update.docname
+        doc.remote_site_name = event_producer
+
+        if update.has_name_conversion:
+            doc.name = str(update.modified_name)
+
+        doc.insert(set_child_names=False, set_name=doc.name)
 
 def set_update(update, producer_site):
 	"""Sync update type update"""
 	local_doc = get_local_doc(update, producer_site)
 	if local_doc:
-		data = frappe._dict(update.data)
+		current_data = update.data
+		modified_data = modify_update_data_based_on_config(current_data, producer_site, update.ref_doctype)
+		data = frappe._dict(modified_data)
 
 		if data.changed:
 			local_doc.update(data.changed)
@@ -433,6 +537,7 @@ def get_local_doc(update, producer_site=None):
 		if update.use_remote_doc and producer_site:
 			foreign_doc = producer_site.get_doc(update.ref_doctype, update.docname)
 			target_docname = foreign_doc.get("remote_docname")
+			update.local_document_name = target_docname
 			return frappe.get_doc(update.ref_doctype, target_docname)
 		if not update.use_same_name:
 			return frappe.get_doc(update.ref_doctype, {"remote_docname": update.docname})
@@ -440,6 +545,16 @@ def get_local_doc(update, producer_site=None):
 	except frappe.DoesNotExistError:
 		return None
 
+def get_event_streaming_map():
+    """Retrieve the map from cache, or rebuild it if it's missing."""
+    cache = frappe.cache()
+    event_streaming_map = cache.get_value(EVENT_STREAMING_CACHE_KEY)
+    
+    if event_streaming_map is None:
+        frappe.get_doc("Event Producer").rebuild_cache()
+        event_streaming_map = cache.get_value(EVENT_STREAMING_CACHE_KEY)
+        
+    return event_streaming_map or {}
 
 def sync_dependencies(document, producer_site):
 	"""
@@ -453,6 +568,8 @@ def sync_dependencies(document, producer_site):
 		"""Sync child table link fields first,
 		then sync link fields,
 		then dynamic links"""
+		if not doc or doc == "" or doc == {} or isinstance(doc, str):
+			return
 		meta = frappe.get_meta(doc.doctype)
 		table_fields = meta.get_table_fields()
 		link_fields = meta.get_link_fields()
@@ -483,32 +600,46 @@ def sync_dependencies(document, producer_site):
 			if docname and not check_dependency_fulfilled(linked_doctype, docname):
 				master_doc = producer_site.get_doc(linked_doctype, docname)
 				frappe.get_doc(master_doc).insert(set_name=docname)
-
 	def set_dependencies(doc, link_fields, producer_site):
+		event_streaming_map = get_event_streaming_map()
+
 		for df in link_fields:
 			docname = doc.get(df.fieldname)
 			linked_doctype = df.get_link_doctype()
-			if docname and not check_dependency_fulfilled(linked_doctype, docname):
-				master_doc = producer_site.get_doc(linked_doctype, docname)
-				try:
-					master_doc = frappe.get_doc(master_doc)
-					master_doc.insert(set_name=docname)
-					frappe.db.commit()
 
-				# for dependency inside a dependency
+			if not docname:
+				continue
+
+			config = event_streaming_map.get(linked_doctype)
+			target_name = docname
+			if config and config.get("use_remote_doc"):
+				foreign_doc = producer_site.get_doc(linked_doctype, docname)
+				target_name = foreign_doc.get("remote_docname")
+			if config and config.get("has_name_conversion") and config.get("name_conversion"):
+				target_name = config.get("name_conversion").replace("|name|", docname)
+			if not check_dependency_fulfilled(linked_doctype, target_name):
+				try:
+					master_doc_dict = producer_site.get_doc(linked_doctype, docname)
+					master_doc = frappe.get_doc(master_doc_dict)
+					
+					master_doc.insert(set_name=target_name)
+					frappe.db.commit()
+					
 				except Exception:
-					dependencies[master_doc] = True
+					dependencies[linked_doctype] = docname
 
 	def check_dependency_fulfilled(linked_doctype, docname):
 		return frappe.db.exists(linked_doctype, docname)
-
 	while dependencies[document]:
 		# find the first non synced dependency
 		for item in reversed(list(dependencies.keys())):
 			if dependencies[item]:
 				dependency = item
 				break
-
+		if isinstance(dependency, str):
+			dependencies[dependency] = False
+			dependencies[document] = False
+			continue
 		check_doc_has_dependencies(dependency, producer_site)
 
 		# mark synced for nested dependency
@@ -549,8 +680,10 @@ def log_event_sync(update, event_producer, sync_status, error=None):
 	doc.mapping = update.mapping if update.mapping else None
 	if update.use_same_name:
 		doc.docname = update.docname
-	elif not update.use_same_name and update.has_name_conversion and update.update_type == "Create":
+	elif not update.use_same_name and update.has_name_conversion and update.update_type == "Create" and not update.use_remote_doc:
 		doc.docname = update.modified_name
+	elif not update.use_same_name and update.use_remote_doc:
+		doc.docname = update.local_document_name
 	else:
 		doc.docname = frappe.db.get_value(update.ref_doctype, {"remote_docname": update.docname}, "name")
 	if error:
