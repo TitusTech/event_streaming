@@ -408,34 +408,30 @@ def set_insert(update, producer_site, event_producer):
         update.data["name"] = update.modified_name
 
     current_update_data = update.data
-    modified_update_data = modify_insert_data_based_on_config(current_update_data, producer_site, event_producer)
+    modified_update_data = modify_insert_data_based_on_config(
+        current_update_data, producer_site, event_producer
+    )
 
     doc = frappe.get_doc(modified_update_data)
     meta = frappe.get_meta(doc.doctype)
     link_fields = meta.get_link_fields()
 
-    for field in link_fields:
-        linked_doctype = field.options
-        config = event_streaming_map.get(linked_doctype)
-
-        if config and config.get("use_remote_doc"):
-            foreign_doc = producer_site.get_doc(update.ref_doctype, update.docname)
-            target_docname = foreign_doc.get("remote_docname")
-            doc.set(field.fieldname, target_docname)
 
     if update.mapping:
         if update.get("dependencies"):
-            dependencies_created = sync_mapped_dependencies(update.dependencies, producer_site)
+            dependencies_created = sync_mapped_dependencies(
+                update.dependencies, producer_site
+            )
             for fieldname, value in dependencies_created.items():
                 doc.update({fieldname: value})
     else:
-        sync_dependencies(doc, producer_site, event_producer)
+        sync_dependencies(doc, producer_site)
 
     if update.use_same_name:
         doc.insert(set_name=update.docname, set_child_names=False)
     else:
         doc.remote_docname = update.docname
-        doc.remote_site_name = event_producer
+        doc.remote_site_name = event_producer.producer_url
 
         if update.has_name_conversion:
             doc.name = str(update.modified_name)
@@ -465,7 +461,7 @@ def set_update(update, producer_site, event_producer):
 				for fieldname, value in dependencies_created.items():
 					local_doc.update({fieldname: value})
 		else:
-			sync_dependencies(local_doc, producer_site, event_producer)
+			sync_dependencies(local_doc, producer_site)
 
 		local_doc.save()
 		local_doc.db_update_all()
@@ -558,36 +554,42 @@ def get_event_streaming_map(producer_url):
 
     return event_streaming_map or {}
 
-def sync_dependencies(document, producer_site, event_producer):
+def sync_dependencies(document, producer_site):
+	"""
+	dependencies is a dictionary to store all the docs
+	having dependencies and their sync status,
+	which is shared among all nested functions.
+	"""
 	dependencies = {document: True}
 
-	def check_doc_has_dependencies(doc, producer_site, event_producer):
-		if not doc or doc == "" or doc == {} or isinstance(doc, str):
-			return
+	def check_doc_has_dependencies(doc, producer_site):
+		"""Sync child table link fields first,
+		then sync link fields,
+		then dynamic links"""
 		meta = frappe.get_meta(doc.doctype)
 		table_fields = meta.get_table_fields()
 		link_fields = meta.get_link_fields()
 		dl_fields = meta.get_dynamic_link_fields()
 		if table_fields:
-			sync_child_table_dependencies(doc, table_fields, producer_site, event_producer)
+			sync_child_table_dependencies(doc, table_fields, producer_site)
 		if link_fields:
-			sync_link_dependencies(doc, link_fields, producer_site, event_producer)
+			sync_link_dependencies(doc, link_fields, producer_site)
 		if dl_fields:
-			sync_dynamic_link_dependencies(doc, dl_fields, producer_site, event_producer)
+			sync_dynamic_link_dependencies(doc, dl_fields, producer_site)
 
-	def sync_child_table_dependencies(doc, table_fields, producer_site, event_producer):
+	def sync_child_table_dependencies(doc, table_fields, producer_site):
 		for df in table_fields:
 			child_table = doc.get(df.fieldname)
 			for entry in child_table:
 				child_doc = producer_site.get_doc(entry.doctype, entry.name)
 				if child_doc:
 					child_doc = frappe._dict(child_doc)
-					set_dependencies(child_doc, frappe.get_meta(entry.doctype).get_link_fields(), producer_site, event_producer)
+					set_dependencies(child_doc, frappe.get_meta(entry.doctype).get_link_fields(), producer_site)
 
-	def sync_link_dependencies(doc, link_fields, producer_site, event_producer):
-		set_dependencies(doc, link_fields, producer_site, event_producer)
+	def sync_link_dependencies(doc, link_fields, producer_site):
+		set_dependencies(doc, link_fields, producer_site)
 
-	def sync_dynamic_link_dependencies(doc, dl_fields, producer_site, event_producer):
+	def sync_dynamic_link_dependencies(doc, dl_fields, producer_site):
 		for df in dl_fields:
 			docname = doc.get(df.fieldname)
 			linked_doctype = doc.get(df.options)
@@ -595,55 +597,40 @@ def sync_dependencies(document, producer_site, event_producer):
 				master_doc = producer_site.get_doc(linked_doctype, docname)
 				frappe.get_doc(master_doc).insert(set_name=docname)
 
-	def set_dependencies(doc, link_fields, producer_site, event_producer):
-		event_streaming_map = get_event_streaming_map(event_producer.producer_url)
-
+	def set_dependencies(doc, link_fields, producer_site):
 		for df in link_fields:
 			docname = doc.get(df.fieldname)
 			linked_doctype = df.get_link_doctype()
-
-			if not docname:
-				continue
-
-			config = event_streaming_map.get(linked_doctype)
-			target_name = docname
-
-			if config and config.get("use_remote_doc"):
-				foreign_doc = producer_site.get_doc(linked_doctype, docname)
-				target_name = foreign_doc.get("remote_docname")
-
-			if config and config.get("has_name_conversion") and config.get("name_conversion"):
-				target_name = config.get("name_conversion").replace("|name|", docname)
-
-			if not check_dependency_fulfilled(linked_doctype, target_name):
+			if docname and not check_dependency_fulfilled(linked_doctype, docname):
+				master_doc = producer_site.get_doc(linked_doctype, docname)
 				try:
-					master_doc_dict = producer_site.get_doc(linked_doctype, docname)
-					master_doc = frappe.get_doc(master_doc_dict)
-					master_doc.insert(set_name=target_name)
+					master_doc = frappe.get_doc(master_doc)
+					master_doc.insert(set_name=docname)
 					frappe.db.commit()
+
+				# for dependency inside a dependency
 				except Exception:
-					dependencies[linked_doctype] = docname
+					dependencies[master_doc] = True
 
 	def check_dependency_fulfilled(linked_doctype, docname):
 		return frappe.db.exists(linked_doctype, docname)
 
 	while dependencies[document]:
+		# find the first non synced dependency
 		for item in reversed(list(dependencies.keys())):
 			if dependencies[item]:
 				dependency = item
 				break
 
-		if isinstance(dependency, str):
-			dependencies[dependency] = False
-			dependencies[document] = False
-			continue
+		check_doc_has_dependencies(dependency, producer_site)
 
-		check_doc_has_dependencies(dependency, producer_site, event_producer)
-
+		# mark synced for nested dependency
 		if dependency != document:
 			dependencies[dependency] = False
 			dependency.insert()
 
+		# no more dependencies left to be synced, the main doc is ready to be synced
+		# end the dependency loop
 		if not any(list(dependencies.values())[1:]):
 			dependencies[document] = False
 
