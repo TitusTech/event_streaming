@@ -354,7 +354,7 @@ def modify_insert_data_based_on_config(update_data, producer_site, event_produce
             current_val = update_data.get(field.fieldname)
             if current_val:
                 target_name = config.get("name_conversion").replace("|name|", current_val)
-                update_data[field.fieldname] = target_docname
+                update_data[field.fieldname] = target_name
         else:
             print(f"No sync config for {field.fieldname} ({linked_doctype})")
 
@@ -463,8 +463,11 @@ def set_update(update, producer_site, event_producer):
 		else:
 			sync_dependencies(local_doc, producer_site)
 
-		local_doc.save()
-		local_doc.db_update_all()
+		if local_doc.docstatus == 1:
+			local_doc.db_update_all()
+		else:
+			local_doc.save()
+			local_doc.db_update_all()
 
 
 def update_row_removed(local_doc, removed):
@@ -605,6 +608,8 @@ def sync_dependencies(document, producer_site):
 				master_doc = producer_site.get_doc(linked_doctype, docname)
 				try:
 					master_doc = frappe.get_doc(master_doc)
+					master_doc.flags.ignore_permissions = True
+					master_doc.flags.ignore_validate = True
 					master_doc.insert(set_name=docname)
 					frappe.db.commit()
 
@@ -627,6 +632,8 @@ def sync_dependencies(document, producer_site):
 		# mark synced for nested dependency
 		if dependency != document:
 			dependencies[dependency] = False
+			dependency.flags.ignore_permissions = True
+			dependency.flags.ignore_validate = True
 			dependency.insert()
 
 		# no more dependencies left to be synced, the main doc is ready to be synced
