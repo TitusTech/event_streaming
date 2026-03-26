@@ -354,7 +354,7 @@ def modify_insert_data_based_on_config(update_data, producer_site, event_produce
             current_val = update_data.get(field.fieldname)
             if current_val:
                 target_name = config.get("name_conversion").replace("|name|", current_val)
-                update_data[field.fieldname] = target_name
+                update_data[field.fieldname] = target_docname
         else:
             print(f"No sync config for {field.fieldname} ({linked_doctype})")
 
