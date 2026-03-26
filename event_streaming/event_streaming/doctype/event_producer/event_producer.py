@@ -428,7 +428,7 @@ def set_insert(update, producer_site, event_producer):
         sync_dependencies(doc, producer_site)
 
     if update.use_same_name:
-        doc.insert(set_name=update.docname, set_child_names=False)
+        insert_doc_without_workflow(doc, set_name=update.docname, set_child_names=False)
     else:
         doc.remote_docname = update.docname
         doc.remote_site_name = event_producer.producer_url
@@ -436,7 +436,7 @@ def set_insert(update, producer_site, event_producer):
         if update.has_name_conversion:
             doc.name = str(update.modified_name)
 
-        doc.insert(set_child_names=False, set_name=doc.name)
+        insert_doc_without_workflow(doc, set_child_names=False, set_name=doc.name)
 
 def set_update(update, producer_site, event_producer):
 	"""Sync update type update"""
@@ -506,7 +506,7 @@ def update_row_added(local_doc, added):
 			child_doc = frappe.get_doc(child)
 			child_doc.parent = local_doc.name
 			child_doc.parenttype = local_doc.doctype
-			child_doc.insert(set_name=child_doc.name)
+			insert_doc_without_workflow(child_doc, set_name=child_doc.name)
 	return local_doc
 
 
@@ -559,17 +559,16 @@ def get_event_streaming_map(producer_url):
 
 
 def insert_doc_without_workflow(doc, **kwargs):
-	workflow_name = frappe.db.get_value("Workflow", {"document_type": doc.doctype, "is_active": 1}, "name")
-	workflow_state_field = frappe.db.get_value("Workflow", workflow_name, "workflow_state_field") if workflow_name else None
-	actual_state = doc.get(workflow_state_field) if workflow_state_field else None
+    workflow_name = frappe.db.get_value("Workflow", {"document_type": doc.doctype, "is_active": 1}, "name")
+    workflow_state_field = frappe.db.get_value("Workflow", workflow_name, "workflow_state_field") if workflow_name else None
+    actual_state = doc.get(workflow_state_field) if workflow_state_field else None
 
-	if workflow_state_field and actual_state:
-		doc.set(workflow_state_field, None)
-
-	doc.insert(**kwargs)
-
-	if workflow_state_field and actual_state:
-		frappe.db.set_value(doc.doctype, doc.name, workflow_state_field, actual_state)
+    if workflow_state_field and actual_state:
+        doc.set(workflow_state_field, None)
+    doc.insert(**kwargs)
+    if workflow_state_field and actual_state:
+        frappe.db.set_value(doc.doctype, doc.name, workflow_state_field, actual_state)
+        frappe.db.commit()
 
 
 def sync_dependencies(document, producer_site):
@@ -692,7 +691,7 @@ def log_event_sync(update, event_producer, sync_status, error=None):
 		doc.docname = frappe.db.get_value(update.ref_doctype, {"remote_docname": update.docname}, "name")
 	if error:
 		doc.error = error
-	doc.insert()
+	insert_doc_without_workflow(doc)
 
 
 def get_mapped_update(update, producer_site):
