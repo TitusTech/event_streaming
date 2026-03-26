@@ -598,7 +598,11 @@ def sync_dependencies(document, producer_site):
 			linked_doctype = doc.get(df.options)
 			if docname and not check_dependency_fulfilled(linked_doctype, docname):
 				master_doc = producer_site.get_doc(linked_doctype, docname)
-				frappe.get_doc(master_doc).insert(set_name=docname)
+				try:
+					frappe.flags.in_import = True
+					frappe.get_doc(master_doc).insert(set_name=docname)
+				finally:
+					frappe.flags.in_import = False
 
 	def set_dependencies(doc, link_fields, producer_site):
 		for df in link_fields:
@@ -610,12 +614,15 @@ def sync_dependencies(document, producer_site):
 					master_doc = frappe.get_doc(master_doc)
 					master_doc.flags.ignore_permissions = True
 					master_doc.flags.ignore_validate = True
+					frappe.flags.in_import = True
 					master_doc.insert(set_name=docname)
 					frappe.db.commit()
 
 				# for dependency inside a dependency
 				except Exception:
 					dependencies[master_doc] = True
+				finally:
+					frappe.flags.in_import = False
 
 	def check_dependency_fulfilled(linked_doctype, docname):
 		return frappe.db.exists(linked_doctype, docname)
@@ -634,7 +641,11 @@ def sync_dependencies(document, producer_site):
 			dependencies[dependency] = False
 			dependency.flags.ignore_permissions = True
 			dependency.flags.ignore_validate = True
-			dependency.insert()
+			try:
+				frappe.flags.in_import = True
+				dependency.insert()
+			finally:
+				frappe.flags.in_import = False
 
 		# no more dependencies left to be synced, the main doc is ready to be synced
 		# end the dependency loop
@@ -648,7 +659,11 @@ def sync_mapped_dependencies(dependencies, producer_site):
 		doc = frappe._dict(json.loads(entry[1]))
 		docname = frappe.db.exists(doc.doctype, doc.name)
 		if not docname:
-			doc = frappe.get_doc(doc).insert(set_child_names=False)
+			try:
+				frappe.flags.in_import = True
+				doc = frappe.get_doc(doc).insert(set_child_names=False)
+			finally:
+				frappe.flags.in_import = False
 			dependencies_created[entry[0]] = doc.name
 		else:
 			dependencies_created[entry[0]] = docname
