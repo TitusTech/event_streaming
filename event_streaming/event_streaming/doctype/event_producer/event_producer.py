@@ -557,6 +557,21 @@ def get_event_streaming_map(producer_url):
 
     return event_streaming_map or {}
 
+
+def insert_doc_without_workflow(doc, **kwargs):
+	workflow_name = frappe.db.get_value("Workflow", {"document_type": doc.doctype, "is_active": 1}, "name")
+	workflow_state_field = frappe.db.get_value("Workflow", workflow_name, "workflow_state_field") if workflow_name else None
+	actual_state = doc.get(workflow_state_field) if workflow_state_field else None
+
+	if workflow_state_field and actual_state:
+		doc.set(workflow_state_field, None)
+
+	doc.insert(**kwargs)
+
+	if workflow_state_field and actual_state:
+		frappe.db.set_value(doc.doctype, doc.name, workflow_state_field, actual_state)
+
+
 def sync_dependencies(document, producer_site):
 	"""
 	dependencies is a dictionary to store all the docs
@@ -598,11 +613,7 @@ def sync_dependencies(document, producer_site):
 			linked_doctype = doc.get(df.options)
 			if docname and not check_dependency_fulfilled(linked_doctype, docname):
 				master_doc = producer_site.get_doc(linked_doctype, docname)
-				try:
-					frappe.flags.in_import = True
-					frappe.get_doc(master_doc).insert(set_name=docname)
-				finally:
-					frappe.flags.in_import = False
+				insert_doc_without_workflow(master_doc, set_name=docname)
 
 	def set_dependencies(doc, link_fields, producer_site):
 		for df in link_fields:
@@ -614,15 +625,12 @@ def sync_dependencies(document, producer_site):
 					master_doc = frappe.get_doc(master_doc)
 					master_doc.flags.ignore_permissions = True
 					master_doc.flags.ignore_validate = True
-					frappe.flags.in_import = True
-					master_doc.insert(set_name=docname)
+					insert_doc_without_workflow(master_doc, set_name=docname)
 					frappe.db.commit()
 
 				# for dependency inside a dependency
 				except Exception:
 					dependencies[master_doc] = True
-				finally:
-					frappe.flags.in_import = False
 
 	def check_dependency_fulfilled(linked_doctype, docname):
 		return frappe.db.exists(linked_doctype, docname)
@@ -641,11 +649,7 @@ def sync_dependencies(document, producer_site):
 			dependencies[dependency] = False
 			dependency.flags.ignore_permissions = True
 			dependency.flags.ignore_validate = True
-			try:
-				frappe.flags.in_import = True
-				dependency.insert()
-			finally:
-				frappe.flags.in_import = False
+			insert_doc_without_workflow(dependency)
 
 		# no more dependencies left to be synced, the main doc is ready to be synced
 		# end the dependency loop
@@ -659,11 +663,7 @@ def sync_mapped_dependencies(dependencies, producer_site):
 		doc = frappe._dict(json.loads(entry[1]))
 		docname = frappe.db.exists(doc.doctype, doc.name)
 		if not docname:
-			try:
-				frappe.flags.in_import = True
-				doc = frappe.get_doc(doc).insert(set_child_names=False)
-			finally:
-				frappe.flags.in_import = False
+			doc = insert_doc_without_workflow(frappe.get_doc(doc), set_child_names=False)
 			dependencies_created[entry[0]] = doc.name
 		else:
 			dependencies_created[entry[0]] = docname
