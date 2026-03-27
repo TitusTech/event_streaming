@@ -559,101 +559,84 @@ def get_event_streaming_map(producer_url):
 
 
 def insert_doc_without_workflow(doc, **kwargs):
+    if isinstance(doc, dict):
+        doc = frappe.get_doc(doc)
+
     workflow_name = frappe.db.get_value("Workflow", {"document_type": doc.doctype, "is_active": 1}, "name")
     workflow_state_field = frappe.db.get_value("Workflow", workflow_name, "workflow_state_field") if workflow_name else None
     actual_state = doc.get(workflow_state_field) if workflow_state_field else None
 
     if workflow_state_field and actual_state:
         doc.set(workflow_state_field, None)
-    doc.insert(**kwargs)
+
+    try:
+        doc.insert(**kwargs)
+    except frappe.DuplicateEntryError:
+        existing = frappe.get_doc(doc.doctype, doc.name)
+        existing.update(doc.as_dict())
+        existing.db_update_all()
+
     if workflow_state_field and actual_state:
         frappe.db.set_value(doc.doctype, doc.name, workflow_state_field, actual_state)
         frappe.db.commit()
 
 
 def sync_dependencies(document, producer_site):
-	"""
-	dependencies is a dictionary to store all the docs
-	having dependencies and their sync status,
-	which is shared among all nested functions.
-	"""
-	dependencies = {document: True}
+    
+    def sync_doc_dependencies(doc, producer_site, visited=None):
+        if visited is None:
+            visited = set()
 
-	def check_doc_has_dependencies(doc, producer_site):
-		"""Sync child table link fields first,
-		then sync link fields,
-		then dynamic links"""
-		meta = frappe.get_meta(doc.doctype)
-		table_fields = meta.get_table_fields()
-		link_fields = meta.get_link_fields()
-		dl_fields = meta.get_dynamic_link_fields()
-		if table_fields:
-			sync_child_table_dependencies(doc, table_fields, producer_site)
-		if link_fields:
-			sync_link_dependencies(doc, link_fields, producer_site)
-		if dl_fields:
-			sync_dynamic_link_dependencies(doc, dl_fields, producer_site)
+        doctype = doc.doctype if hasattr(doc, "doctype") else doc.get("doctype")
+        docname = doc.name if hasattr(doc, "name") else doc.get("name")
+        key = f"{doctype}::{docname}"
 
-	def sync_child_table_dependencies(doc, table_fields, producer_site):
-		for df in table_fields:
-			child_table = doc.get(df.fieldname)
-			for entry in child_table:
-				child_doc = producer_site.get_doc(entry.doctype, entry.name)
-				if child_doc:
-					child_doc = frappe._dict(child_doc)
-					set_dependencies(child_doc, frappe.get_meta(entry.doctype).get_link_fields(), producer_site)
+        if key in visited:
+            return
+        visited.add(key)
 
-	def sync_link_dependencies(doc, link_fields, producer_site):
-		set_dependencies(doc, link_fields, producer_site)
+        meta = frappe.get_meta(doctype)
 
-	def sync_dynamic_link_dependencies(doc, dl_fields, producer_site):
-		for df in dl_fields:
-			docname = doc.get(df.fieldname)
-			linked_doctype = doc.get(df.options)
-			if docname and not check_dependency_fulfilled(linked_doctype, docname):
-				master_doc = producer_site.get_doc(linked_doctype, docname)
-				insert_doc_without_workflow(master_doc, set_name=docname)
+        # sync link field dependencies first
+        for df in meta.get_link_fields():
+            linked_docname = doc.get(df.fieldname)
+            linked_doctype = df.get_link_doctype()
+            if linked_docname and not frappe.db.exists(linked_doctype, linked_docname):
+                master_doc = producer_site.get_doc(linked_doctype, linked_docname)
+                if master_doc:
+                    master_doc = frappe.get_doc(master_doc)
+                    sync_doc_dependencies(master_doc, producer_site, visited)
+                    insert_doc_without_workflow(master_doc, set_name=linked_docname)
+                    frappe.db.commit()
 
-	def set_dependencies(doc, link_fields, producer_site):
-		for df in link_fields:
-			docname = doc.get(df.fieldname)
-			linked_doctype = df.get_link_doctype()
-			if docname and not check_dependency_fulfilled(linked_doctype, docname):
-				master_doc = producer_site.get_doc(linked_doctype, docname)
-				try:
-					master_doc = frappe.get_doc(master_doc)
-					master_doc.flags.ignore_permissions = True
-					master_doc.flags.ignore_validate = True
-					insert_doc_without_workflow(master_doc, set_name=docname)
-					frappe.db.commit()
+        # sync dynamic link field dependencies
+        for df in meta.get_dynamic_link_fields():
+            linked_docname = doc.get(df.fieldname)
+            linked_doctype = doc.get(df.options)
+            if linked_docname and linked_doctype and not frappe.db.exists(linked_doctype, linked_docname):
+                master_doc = producer_site.get_doc(linked_doctype, linked_docname)
+                if master_doc:
+                    master_doc = frappe.get_doc(master_doc)
+                    sync_doc_dependencies(master_doc, producer_site, visited)
+                    insert_doc_without_workflow(master_doc, set_name=linked_docname)
+                    frappe.db.commit()
 
-				# for dependency inside a dependency
-				except Exception:
-					dependencies[master_doc] = True
+        # sync child table link dependencies
+        for df in meta.get_table_fields():
+            for entry in (doc.get(df.fieldname) or []):
+                child_meta = frappe.get_meta(entry.doctype if hasattr(entry, "doctype") else entry.get("doctype"))
+                for child_df in child_meta.get_link_fields():
+                    linked_docname = entry.get(child_df.fieldname)
+                    linked_doctype = child_df.get_link_doctype()
+                    if linked_docname and not frappe.db.exists(linked_doctype, linked_docname):
+                        master_doc = producer_site.get_doc(linked_doctype, linked_docname)
+                        if master_doc:
+                            master_doc = frappe.get_doc(master_doc)
+                            sync_doc_dependencies(master_doc, producer_site, visited)
+                            insert_doc_without_workflow(master_doc, set_name=linked_docname)
+                            frappe.db.commit()
 
-	def check_dependency_fulfilled(linked_doctype, docname):
-		return frappe.db.exists(linked_doctype, docname)
-
-	while dependencies[document]:
-		# find the first non synced dependency
-		for item in reversed(list(dependencies.keys())):
-			if dependencies[item]:
-				dependency = item
-				break
-
-		check_doc_has_dependencies(dependency, producer_site)
-
-		# mark synced for nested dependency
-		if dependency != document:
-			dependencies[dependency] = False
-			dependency.flags.ignore_permissions = True
-			dependency.flags.ignore_validate = True
-			insert_doc_without_workflow(dependency)
-
-		# no more dependencies left to be synced, the main doc is ready to be synced
-		# end the dependency loop
-		if not any(list(dependencies.values())[1:]):
-			dependencies[document] = False
+    sync_doc_dependencies(document, producer_site)
 
 
 def sync_mapped_dependencies(dependencies, producer_site):
@@ -691,7 +674,7 @@ def log_event_sync(update, event_producer, sync_status, error=None):
 		doc.docname = frappe.db.get_value(update.ref_doctype, {"remote_docname": update.docname}, "name")
 	if error:
 		doc.error = error
-	insert_doc_without_workflow(doc)
+	doc.insert()
 
 
 def get_mapped_update(update, producer_site):
