@@ -577,7 +577,8 @@ def insert_doc_without_workflow(doc, **kwargs):
         non_table_fields = {
             df.fieldname: doc.get(df.fieldname)
             for df in meta.fields
-            if df.fieldtype not in ("Table", "Table MultiSelect")
+            if df.fieldtype not in ("Table", "Table MultiSelect", "Section Break", "Column Break", "Tab Break", "HTML", "Button")
+            and not df.get("is_virtual")
         }
         frappe.db.set_value(doc.doctype, doc.name, non_table_fields)
 
