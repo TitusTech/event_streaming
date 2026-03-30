@@ -572,9 +572,35 @@ def insert_doc_without_workflow(doc, **kwargs):
     try:
         doc.insert(**kwargs)
     except frappe.DuplicateEntryError:
-        existing = frappe.get_doc(doc.doctype, doc.name)
-        existing.update(doc.as_dict())
-        existing.db_update_all()
+        meta = frappe.get_meta(doc.doctype)
+
+        non_table_fields = {
+            df.fieldname: doc.get(df.fieldname)
+            for df in meta.fields
+            if df.fieldtype not in ("Table", "Table MultiSelect")
+        }
+        frappe.db.set_value(doc.doctype, doc.name, non_table_fields)
+
+        # delete and reinsert child table rows at db level
+        for df in meta.fields:
+            if df.fieldtype in ("Table", "Table MultiSelect"):
+                frappe.db.delete(df.options, {"parent": doc.name, "parenttype": doc.doctype})
+                for row in (doc.get(df.fieldname) or []):
+                    row_dict = row.as_dict() if hasattr(row, "as_dict") else dict(row)
+                    row_dict.update({
+                        "parent": doc.name,
+                        "parenttype": doc.doctype,
+                        "parentfield": df.fieldname,
+                    })
+                    child_meta = frappe.get_meta(df.options)
+                    valid_fields = {cdf.fieldname for cdf in child_meta.fields} | {"name", "parent", "parenttype", "parentfield", "idx", "docstatus", "creation", "modified", "modified_by", "owner"}
+                    row_dict = {k: v for k, v in row_dict.items() if k in valid_fields}
+                    columns = ", ".join(f"`{k}`" for k in row_dict)
+                    values = ", ".join(["%s"] * len(row_dict))
+                    frappe.db.sql(
+                        f"INSERT INTO `tab{df.options}` ({columns}) VALUES ({values})",
+                        list(row_dict.values())
+                    )
 
     if workflow_state_field and actual_state:
         frappe.db.set_value(doc.doctype, doc.name, workflow_state_field, actual_state)
