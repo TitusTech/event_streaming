@@ -345,7 +345,7 @@ def modify_insert_data_based_on_config(update_data, producer_site, event_produce
         config = event_streaming_map.get(linked_doctype)
         
 
-        if config and config.get("use_remote_doc"):
+        if config and config.get("use_remote_doc") and update_data.get(field.fieldname):
             foreign_doc = producer_site.get_doc(linked_doctype, update_data.get(field.fieldname))
             target_docname = foreign_doc.get("remote_docname")
             update_data[field.fieldname] = target_docname
@@ -354,7 +354,7 @@ def modify_insert_data_based_on_config(update_data, producer_site, event_produce
             current_val = update_data.get(field.fieldname)
             if current_val:
                 target_name = config.get("name_conversion").replace("|name|", current_val)
-                update_data[field.fieldname] = target_docname
+                update_data[field.fieldname] = target_name
         else:
             print(f"No sync config for {field.fieldname} ({linked_doctype})")
 
@@ -568,7 +568,7 @@ def insert_doc_without_workflow(doc, **kwargs):
 
     if workflow_state_field and actual_state:
         doc.set(workflow_state_field, None)
-
+    doc.flags.ignore_validate = True
     try:
         doc.insert(**kwargs)
     except frappe.DuplicateEntryError:
