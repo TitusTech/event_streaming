@@ -14,6 +14,7 @@
   "has_name_conversion",
   "name_conversion",
   "use_remote_doc",
+  "stream_directly_in_db",
   "condition"
  ],
  "fields": [
@@ -92,11 +93,17 @@
    "fieldname": "use_remote_doc",
    "fieldtype": "Check",
    "label": "Use Remote Doc"
+  },
+  {
+   "default": "0",
+   "fieldname": "stream_directly_in_db",
+   "fieldtype": "Check",
+   "label": "Stream Directly In DB"
   }
  ],
  "istable": 1,
  "links": [],
- "modified": "2026-02-13 13:56:41.528542",
+ "modified": "2026-04-09 10:19:48.991804",
  "modified_by": "Administrator",
  "module": "Event Streaming",
  "name": "Event Producer Document Type",
