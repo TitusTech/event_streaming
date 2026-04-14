@@ -259,7 +259,7 @@ def pull_from_node(event_producer):
 	producer_site = get_producer_site(event_producer.producer_url)
 	last_update = event_producer.get_last_update()
 
-	(doctypes, mapping_config, naming_config, name_conversion_config, name_conversion, use_remote_doc) = get_config(event_producer.producer_doctypes)
+	(doctypes, mapping_config, naming_config, name_conversion_config, name_conversion, use_remote_doc, stream_directly_in_db) = get_config(event_producer.producer_doctypes)
 
 	updates = get_updates(producer_site, last_update, doctypes)
 
@@ -267,6 +267,7 @@ def pull_from_node(event_producer):
 		update.use_same_name = naming_config.get(update.ref_doctype)
 		update.has_name_conversion = name_conversion_config.get(update.ref_doctype)
 		update.use_remote_doc = use_remote_doc.get(update.ref_doctype)
+		update.stream_directly_in_db = stream_directly_in_db.get(update.ref_doctype)
 		if update.has_name_conversion:
 			update.name_conversion = name_conversion.get(update.ref_doctype)
 		mapping = mapping_config.get(update.ref_doctype)
@@ -281,7 +282,7 @@ def pull_from_node(event_producer):
 
 def get_config(event_config):
 	"""get the doctype mapping and naming configurations for consumption"""
-	doctypes, mapping_config, naming_config, name_conversion_config, name_conversion, use_remote_doc = [], {}, {}, {}, {}, {}
+	doctypes, mapping_config, naming_config, name_conversion_config, name_conversion, use_remote_doc, stream_directly_in_db = [], {}, {}, {}, {}, {}, {}
 
 	for entry in event_config:
 		if entry.status == "Approved":
@@ -299,12 +300,14 @@ def get_config(event_config):
 			if entry.has_name_conversion:
 				name_conversion[entry.ref_doctype] = entry.name_conversion
 			use_remote_doc[entry.ref_doctype] = entry.use_remote_doc
-	return (doctypes, mapping_config, naming_config, name_conversion_config, name_conversion, use_remote_doc)
+			stream_directly_in_db[entry.ref_doctype] = entry.stream_directly_in_db
+	return (doctypes, mapping_config, naming_config, name_conversion_config, name_conversion, use_remote_doc, stream_directly_in_db)
 
 
 def sync(update, producer_site, event_producer, in_retry=False):
     """Sync the individual update"""
     frappe.flags.in_event_streaming = True
+    frappe.flags.stream_directly_in_db = bool(update.get("stream_directly_in_db"))
     try:
         if update.update_type == "Create":
             if not update.use_same_name and update.has_name_conversion:
@@ -329,6 +332,7 @@ def sync(update, producer_site, event_producer, in_retry=False):
 
     finally:
         frappe.flags.in_event_streaming = False
+        frappe.flags.stream_directly_in_db = False
 
     event_producer.set_last_update(update.creation)
     frappe.db.commit()
@@ -463,11 +467,65 @@ def set_update(update, producer_site, event_producer):
 		else:
 			sync_dependencies(local_doc, producer_site)
 
-		if local_doc.docstatus == 1:
+		if frappe.flags.get("stream_directly_in_db"):
+			update_doc_directly(local_doc, data)
+		elif local_doc.docstatus == 1:
 			local_doc.db_update_all()
 		else:
 			local_doc.save()
 			local_doc.db_update_all()
+
+
+def update_doc_directly(local_doc, data):
+	if data.changed:
+		frappe.db.set_value(local_doc.doctype, local_doc.name, data.changed, update_modified=False)
+
+	if data.removed:
+		for tablename, rownames in data.removed.items():
+			child_doctype = local_doc.get_table_field_doctype(tablename)
+			for rowname in rownames:
+				frappe.db.delete(child_doctype, {"name": rowname, "parent": local_doc.name})
+
+	if data.row_changed:
+		for tablename, rows in data.row_changed.items():
+			child_doctype = local_doc.get_table_field_doctype(tablename)
+			for row in rows:
+				row_name = row.get("name") if isinstance(row, dict) else row["name"]
+				row_fields = {k: v for k, v in row.items() if k != "name"}
+				if row_name and row_fields:
+					frappe.db.set_value(child_doctype, row_name, row_fields, update_modified=False)
+
+	if data.added:
+		for tablename, rows in data.added.items():
+			child_doctype = local_doc.get_table_field_doctype(tablename)
+			child_meta = frappe.get_meta(child_doctype)
+			valid_fields = (
+				{cdf.fieldname for cdf in child_meta.fields}
+				| {"name", "parent", "parenttype", "parentfield", "idx", "docstatus",
+				   "creation", "modified", "modified_by", "owner"}
+			)
+			for row in rows:
+				row_dict = row.as_dict() if hasattr(row, "as_dict") else dict(row)
+				row_dict.update({
+					"parent": local_doc.name,
+					"parenttype": local_doc.doctype,
+					"parentfield": tablename,
+				})
+				if not row_dict.get("name"):
+					row_dict["name"] = frappe.generate_hash(length=10)
+				for user_field in ("owner", "modified_by"):
+					if not row_dict.get(user_field):
+						row_dict[user_field] = frappe.session.user or "Administrator"
+				for dt_field in ("creation", "modified"):
+					if not row_dict.get(dt_field):
+						row_dict[dt_field] = frappe.utils.now()
+				row_dict = {k: v for k, v in row_dict.items() if k in valid_fields}
+				columns = ", ".join(f"`{k}`" for k in row_dict)
+				placeholders = ", ".join(["%s"] * len(row_dict))
+				frappe.db.sql(
+					f"INSERT INTO `tab{child_doctype}` ({columns}) VALUES ({placeholders})",
+					list(row_dict.values()),
+				)
 
 
 def update_row_removed(local_doc, removed):
@@ -558,7 +616,107 @@ def get_event_streaming_map(producer_url):
     return event_streaming_map or {}
 
 
+def _get_child_row_dict(row, parent_name, parent_doctype, parent_field, idx):
+    """Build a sanitised dict for a child table row, ready for raw SQL insertion."""
+    row_dict = row.as_dict() if hasattr(row, "as_dict") else dict(row)
+    row_dict.update({
+        "parent": parent_name,
+        "parenttype": parent_doctype,
+        "parentfield": parent_field,
+        "idx": idx,
+    })
+    if not row_dict.get("name"):
+        row_dict["name"] = frappe.generate_hash(length=10)
+    for ts_field in ("owner", "modified_by"):
+        if not row_dict.get(ts_field):
+            row_dict[ts_field] = frappe.session.user or "Administrator"
+    for dt_field in ("creation", "modified"):
+        if not row_dict.get(dt_field):
+            row_dict[dt_field] = frappe.utils.now()
+    child_meta = frappe.get_meta(row_dict.get("doctype") or row.doctype)
+    valid_fields = (
+        {cdf.fieldname for cdf in child_meta.fields}
+        | {"name", "parent", "parenttype", "parentfield", "idx",
+           "docstatus", "creation", "modified", "modified_by", "owner"}
+    )
+    return {k: v for k, v in row_dict.items() if k in valid_fields}
+
+
+def _insert_child_rows_directly(doc, meta):
+    """Insert all child table rows for *doc* using raw SQL (no hooks)."""
+    for df in meta.fields:
+        if df.fieldtype not in ("Table", "Table MultiSelect"):
+            continue
+        for idx, row in enumerate(doc.get(df.fieldname) or [], start=1):
+            row_dict = _get_child_row_dict(row, doc.name, doc.doctype, df.fieldname, idx)
+            columns = ", ".join(f"`{k}`" for k in row_dict)
+            placeholders = ", ".join(["%s"] * len(row_dict))
+            frappe.db.sql(
+                f"INSERT INTO `tab{df.options}` ({columns}) VALUES ({placeholders})",
+                list(row_dict.values()),
+            )
+
+
+def insert_doc_directly(doc, **kwargs):
+    if isinstance(doc, dict):
+        doc = frappe.get_doc(doc)
+
+    set_name = kwargs.get("set_name")
+    if set_name:
+        doc.name = set_name
+
+    for user_field in ("owner", "modified_by"):
+        if not doc.get(user_field):
+            doc.set(user_field, frappe.session.user or "Administrator")
+    for dt_field in ("creation", "modified"):
+        if not doc.get(dt_field):
+            doc.set(dt_field, frappe.utils.now())
+
+    workflow_name = frappe.db.get_value(
+        "Workflow", {"document_type": doc.doctype, "is_active": 1}, "name"
+    )
+    workflow_state_field = (
+        frappe.db.get_value("Workflow", workflow_name, "workflow_state_field")
+        if workflow_name
+        else None
+    )
+    actual_state = doc.get(workflow_state_field) if workflow_state_field else None
+    if workflow_state_field and actual_state:
+        doc.set(workflow_state_field, None)
+
+    meta = frappe.get_meta(doc.doctype)
+
+    try:
+        doc.db_insert()
+        _insert_child_rows_directly(doc, meta)
+    except frappe.DuplicateEntryError:
+        non_table_fields = {
+            df.fieldname: doc.get(df.fieldname)
+            for df in meta.fields
+            if df.fieldtype not in (
+                "Table", "Table MultiSelect", "Section Break",
+                "Column Break", "Tab Break", "HTML", "Button",
+            )
+            and not df.get("is_virtual")
+        }
+        frappe.db.set_value(doc.doctype, doc.name, non_table_fields)
+
+        for df in meta.fields:
+            if df.fieldtype in ("Table", "Table MultiSelect"):
+                frappe.db.delete(df.options, {"parent": doc.name, "parenttype": doc.doctype})
+        _insert_child_rows_directly(doc, meta)
+
+    if workflow_state_field and actual_state:
+        frappe.db.set_value(doc.doctype, doc.name, workflow_state_field, actual_state)
+        frappe.db.commit()
+
+    return doc
+
+
 def insert_doc_without_workflow(doc, **kwargs):
+    if frappe.flags.get("stream_directly_in_db"):
+        return insert_doc_directly(doc, **kwargs)
+
     if isinstance(doc, dict):
         doc = frappe.get_doc(doc)
 
