@@ -478,7 +478,9 @@ def set_update(update, producer_site, event_producer):
 
 def update_doc_directly(local_doc, data):
 	if data.changed:
-		frappe.db.set_value(local_doc.doctype, local_doc.name, data.changed, update_modified=False)
+		changed = {k: v for k, v in data.changed.items() if v is not None}
+		if changed:
+			frappe.db.set_value(local_doc.doctype, local_doc.name, changed, update_modified=False)
 
 	if data.removed:
 		for tablename, rownames in data.removed.items():
@@ -491,7 +493,7 @@ def update_doc_directly(local_doc, data):
 			child_doctype = local_doc.get_table_field_doctype(tablename)
 			for row in rows:
 				row_name = row.get("name") if isinstance(row, dict) else row["name"]
-				row_fields = {k: v for k, v in row.items() if k != "name"}
+				row_fields = {k: v for k, v in row.items() if k != "name" and v is not None}
 				if row_name and row_fields:
 					frappe.db.set_value(child_doctype, row_name, row_fields, update_modified=False)
 
