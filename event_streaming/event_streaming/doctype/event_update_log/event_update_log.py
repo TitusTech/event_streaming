@@ -35,6 +35,9 @@ def notify_consumers(doc, event):
         elif event == "on_trash":
             make_event_update_log(doc, update_type="Delete")
         else:
+            if doc.docstatus == 1 and doc.get_doc_before_save().docstatus == 0:
+                doc.flags.event_update_log = None
+                
             if not doc.flags.event_update_log:
                 diff = get_update(doc.get_doc_before_save(), doc)
                 if diff:
