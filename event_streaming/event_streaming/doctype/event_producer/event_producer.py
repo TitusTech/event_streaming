@@ -591,13 +591,19 @@ def get_updates(producer_site, last_update, doctypes):
 
 
 def get_local_doc(update, producer_site=None):
-	"""Get the local document if created with a different name"""
 	try:
 		if update.use_remote_doc and producer_site:
 			foreign_doc = producer_site.get_doc(update.ref_doctype, update.docname)
 			target_docname = foreign_doc.get("remote_docname")
-			update.local_document_name = target_docname
-			return frappe.get_doc(update.ref_doctype, target_docname)
+
+			if target_docname:
+				update.local_document_name = target_docname
+				return frappe.get_doc(update.ref_doctype, target_docname)
+			else:
+				local = frappe.get_doc(update.ref_doctype, {"remote_docname": update.docname})
+				update.local_document_name = local.name
+				return local
+
 		if not update.use_same_name:
 			return frappe.get_doc(update.ref_doctype, {"remote_docname": update.docname})
 		return frappe.get_doc(update.ref_doctype, update.docname)
