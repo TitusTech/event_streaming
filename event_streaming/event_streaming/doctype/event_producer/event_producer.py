@@ -24,6 +24,7 @@ class EventProducer(Document):
     def rebuild_cache(self):
         records = frappe.get_all(
             "Event Producer Document Type",
+            filters={"parent": self.name},
             fields=["*"],
             ignore_ddl=True,
         )
@@ -429,7 +430,7 @@ def set_insert(update, producer_site, event_producer):
             for fieldname, value in dependencies_created.items():
                 doc.update({fieldname: value})
     else:
-        sync_dependencies(doc, producer_site)
+        sync_dependencies(doc, producer_site, event_producer)
 
     if update.use_same_name:
         insert_doc_without_workflow(doc, set_name=update.docname, set_child_names=False)
@@ -465,7 +466,7 @@ def set_update(update, producer_site, event_producer):
 				for fieldname, value in dependencies_created.items():
 					local_doc.update({fieldname: value})
 		else:
-			sync_dependencies(local_doc, producer_site)
+			sync_dependencies(local_doc, producer_site, event_producer)
 
 		if frappe.flags.get("stream_directly_in_db"):
 			update_doc_directly(local_doc, data)
@@ -774,8 +775,13 @@ def insert_doc_without_workflow(doc, **kwargs):
         frappe.db.commit()
 
 
-def sync_dependencies(document, producer_site):
-    
+def sync_dependencies(document, producer_site, event_producer=None):
+    tracked_doctypes = set()
+    if event_producer:
+        for entry in event_producer.producer_doctypes:
+            if entry.status == "Approved":
+                tracked_doctypes.add(entry.ref_doctype)
+
     def sync_doc_dependencies(doc, producer_site, visited=None):
         if visited is None:
             visited = set()
@@ -794,7 +800,7 @@ def sync_dependencies(document, producer_site):
         for df in meta.get_link_fields():
             linked_docname = doc.get(df.fieldname)
             linked_doctype = df.get_link_doctype()
-            if linked_docname and not frappe.db.exists(linked_doctype, linked_docname):
+            if linked_docname and linked_doctype not in tracked_doctypes and not frappe.db.exists(linked_doctype, linked_docname):
                 master_doc = producer_site.get_doc(linked_doctype, linked_docname)
                 if master_doc:
                     master_doc = frappe.get_doc(master_doc)
@@ -806,7 +812,7 @@ def sync_dependencies(document, producer_site):
         for df in meta.get_dynamic_link_fields():
             linked_docname = doc.get(df.fieldname)
             linked_doctype = doc.get(df.options)
-            if linked_docname and linked_doctype and not frappe.db.exists(linked_doctype, linked_docname):
+            if linked_docname and linked_doctype and linked_doctype not in tracked_doctypes and not frappe.db.exists(linked_doctype, linked_docname):
                 master_doc = producer_site.get_doc(linked_doctype, linked_docname)
                 if master_doc:
                     master_doc = frappe.get_doc(master_doc)
@@ -821,7 +827,7 @@ def sync_dependencies(document, producer_site):
                 for child_df in child_meta.get_link_fields():
                     linked_docname = entry.get(child_df.fieldname)
                     linked_doctype = child_df.get_link_doctype()
-                    if linked_docname and not frappe.db.exists(linked_doctype, linked_docname):
+                    if linked_docname and linked_doctype not in tracked_doctypes and not frappe.db.exists(linked_doctype, linked_docname):
                         master_doc = producer_site.get_doc(linked_doctype, linked_docname)
                         if master_doc:
                             master_doc = frappe.get_doc(master_doc)
