@@ -338,32 +338,46 @@ def sync(update, producer_site, event_producer, in_retry=False):
     event_producer.set_last_update(update.creation)
     frappe.db.commit()
 
+def _remap_linked_docname(linked_doctype, current_val, config, producer_site):
+    """Map a producer-side link value to the matching local docname."""
+    if not current_val:
+        return current_val
+
+    if frappe.get_meta(linked_doctype).get_field("remote_docname"):
+        local_name = frappe.db.get_value(
+            linked_doctype, {"remote_docname": current_val}, "name"
+        )
+        if local_name:
+            return local_name
+
+    if config.get("use_remote_doc") and producer_site:
+        foreign_doc = producer_site.get_doc(linked_doctype, current_val)
+        target_docname = foreign_doc.get("remote_docname")
+        if target_docname:
+            return target_docname
+
+    if config.get("has_name_conversion") and config.get("name_conversion"):
+        return config.get("name_conversion").replace("|name|", current_val)
+
+    return current_val
+
+
 def modify_insert_data_based_on_config(update_data, producer_site, event_producer):
     event_streaming_map = get_event_streaming_map(event_producer.producer_url)
 
     doctype = update_data.get("doctype") if isinstance(update_data, dict) else update_data.doctype
     meta = frappe.get_meta(doctype)
-    link_fields = meta.get_link_fields()
 
-    for field in link_fields:
-        linked_doctype = field.options
-        config = event_streaming_map.get(linked_doctype)
-        
-
-        if config and config.get("use_remote_doc") and update_data.get(field.fieldname):
-            foreign_doc = producer_site.get_doc(linked_doctype, update_data.get(field.fieldname))
-            target_docname = foreign_doc.get("remote_docname")
-            update_data[field.fieldname] = target_docname
-
-        elif config and config.get("has_name_conversion") and config.get("name_conversion"):
-            current_val = update_data.get(field.fieldname)
-            if current_val:
-                target_name = config.get("name_conversion").replace("|name|", current_val)
-                update_data[field.fieldname] = target_name
-        else:
-            print(f"No sync config for {field.fieldname} ({linked_doctype})")
+    for field in meta.get_link_fields():
+        config = event_streaming_map.get(field.options)
+        if not config:
+            continue
+        update_data[field.fieldname] = _remap_linked_docname(
+            field.options, update_data.get(field.fieldname), config, producer_site
+        )
 
     return update_data
+
 
 def modify_update_data_based_on_config(update_diff, producer_site, target_doctype, event_producer):
     event_streaming_map = get_event_streaming_map(event_producer.producer_url)
@@ -375,30 +389,14 @@ def modify_update_data_based_on_config(update_diff, producer_site, target_doctyp
         section_data = update_diff.get(section) or {}
 
         for field in link_fields:
-            fieldname = field.fieldname
-            linked_doctype = field.options
-
-            if fieldname not in section_data:
+            if field.fieldname not in section_data:
                 continue
-
-            config = event_streaming_map.get(linked_doctype)
-
-            current_val = section_data.get(fieldname)
-
-            if not current_val:
+            config = event_streaming_map.get(field.options)
+            if not config:
                 continue
-
-            if config and config.get("use_remote_doc"):
-                foreign_doc = producer_site.get_doc(linked_doctype, current_val)
-                target_docname = foreign_doc.get("remote_docname")
-                section_data[fieldname] = target_docname
-
-            elif config and config.get("has_name_conversion") and config.get("name_conversion"):
-                target_name = config.get("name_conversion").replace("|name|", current_val)
-                section_data[fieldname] = target_name
-
-            else:
-                print(f"No sync config for {fieldname} ({linked_doctype})")
+            section_data[field.fieldname] = _remap_linked_docname(
+                field.options, section_data.get(field.fieldname), config, producer_site
+            )
 
     return update_diff
 def set_insert(update, producer_site, event_producer):
@@ -775,6 +773,21 @@ def insert_doc_without_workflow(doc, **kwargs):
         frappe.db.commit()
 
 
+def _remap_dependency_links(doc, producer_site, event_producer):
+    """Map a dependency doc's link fields to their local docnames before insert."""
+    if not event_producer:
+        return
+    event_streaming_map = get_event_streaming_map(event_producer.producer_url)
+    for field in frappe.get_meta(doc.doctype).get_link_fields():
+        config = event_streaming_map.get(field.options)
+        if not config:
+            continue
+        current = doc.get(field.fieldname)
+        if not current:
+            continue
+        doc.set(field.fieldname, _remap_linked_docname(field.options, current, config, producer_site))
+
+
 def sync_dependencies(document, producer_site, event_producer=None):
     tracked_doctypes = set()
     if event_producer:
@@ -805,6 +818,7 @@ def sync_dependencies(document, producer_site, event_producer=None):
                 if master_doc:
                     master_doc = frappe.get_doc(master_doc)
                     sync_doc_dependencies(master_doc, producer_site, visited)
+                    _remap_dependency_links(master_doc, producer_site, event_producer)
                     insert_doc_without_workflow(master_doc, set_name=linked_docname)
                     frappe.db.commit()
 
@@ -817,6 +831,7 @@ def sync_dependencies(document, producer_site, event_producer=None):
                 if master_doc:
                     master_doc = frappe.get_doc(master_doc)
                     sync_doc_dependencies(master_doc, producer_site, visited)
+                    _remap_dependency_links(master_doc, producer_site, event_producer)
                     insert_doc_without_workflow(master_doc, set_name=linked_docname)
                     frappe.db.commit()
 
@@ -832,6 +847,7 @@ def sync_dependencies(document, producer_site, event_producer=None):
                         if master_doc:
                             master_doc = frappe.get_doc(master_doc)
                             sync_doc_dependencies(master_doc, producer_site, visited)
+                            _remap_dependency_links(master_doc, producer_site, event_producer)
                             insert_doc_without_workflow(master_doc, set_name=linked_docname)
                             frappe.db.commit()
 
