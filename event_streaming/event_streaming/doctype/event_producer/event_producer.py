@@ -169,6 +169,7 @@ class EventProducer(Document):
                         fieldname="remote_docname",
                         label="Remote Document Name",
                         fieldtype="Data",
+                        insert_after="remote_site_name",
                         read_only=1,
                         print_hide=1,
                     )
@@ -183,6 +184,10 @@ class EventProducer(Document):
                         read_only=1,
                         print_hide=1,
                     )
+
+                    if entry.ref_doctype == "Stock Entry":
+                        df["insert_after"] = "stock_entry_details_tab"
+                        
                     create_custom_field(entry.ref_doctype, df)
 
     def update_event_consumer(self):
